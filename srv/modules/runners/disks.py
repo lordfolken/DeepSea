@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 """ This module will match disks based on applied filter rules
 
 Internally this will be called 'DriveGroups'
@@ -12,66 +11,144 @@ import re
 import logging
 from typing import Set, Tuple
 import salt.client
-
+from threading import Thread
 
 log = logging.getLogger(__name__)
-
-
-class NoMatcherFound(Exception):
-    """ A critical error when no Matcher could be applied
-    """
-
-    pass
 
 
 class FilterNotSupported(Exception):
     """ A critical error when the user specified filter is unsupported
     """
+    pass
 
+
+class UnitNotSupported(Exception):
+    """ A critical error which encouters when a unit is parsed which
+    isn't supported.
+    """
     pass
 
 
 # pylint: disable=too-few-public-methods
 class Base(object):
-    """ The base class container for local_client and base_target assignment
+    """ The base class container for local_client and compound_target assignment
     """
 
     def __init__(self, **kwargs):
         self.local_client = salt.client.LocalClient()
-        self.base_target = kwargs.get("target", "*")
+
+        # harden this - validate?
+        self.compound_target: str = list(
+            self.local_client.cmd(
+                'G@deepsea:*',
+                'pillar.get', ['drive_group'],
+                expr_form='compound').values())[0]['target']
+
+        self.resolved_targets: list = list(
+            self.local_client.cmd(self.compound_target, "cmd.run",
+                                  ["test.ping"]).keys())
 
 
-# pylint: disable=too-few-public-methods
+class Filter(object):
+    """ Filter class to assign properties to bare filters.
+
+    This is a utility class that tries to simplify working
+    with information comming from a textfile/salt (drive_group.yaml)/(pillar)
+
+    """
+
+    def __init__(self, **kwargs):
+        self.name: str = str(kwargs.get('name', None))
+        self.matcher = kwargs.get('matcher', None)
+        self.value: str = str(kwargs.get('value', None))
+        self._assign_matchers()
+        log.debug("Initializing filter for {} with value {}".format(
+            self.name, self.value))
+
+    @property
+    def is_matchable(self) -> bool:
+        """ A property to indicate if a Filter has a matcher
+
+        Some filter i.e. 'limit' or 'osd_per_device' are valid filter
+        attributes but cannot be applied to a disk set. In this case
+        we return 'None'
+        :return: If a matcher is present True/Flase
+        :rtype: bool
+        """
+        return self.matcher is not None
+
+    def _assign_matchers(self) -> None:
+        """ Assign a matcher based on filter_name
+
+        This method assigns an individual Matcher based
+        on `self.name` and returns it.
+        """
+        if self.name == "size":
+            self.matcher = SizeMatcher(self.name, self.value)
+        elif self.name == "model":
+            self.matcher = SubstringMatcher(self.name, self.value)
+        elif self.name == "vendor":
+            self.matcher = SubstringMatcher(self.name, self.value)
+        elif self.name == "rotational":
+            self.matcher = EqualityMatcher(self.name, self.value)
+        elif self.name == "all":
+            self.matcher = AllMatcher(self.name, self.value)
+        else:
+            log.debug("No suitable matcher for {} could be found.")
+
+    def __repr__(self) -> str:
+        """ Visual representation of the filter
+        """
+        return 'Filter<{}>'.format(self.name)
+
+
 class Inventory(Base):
     """ The Inventory class
 
-    Just a container for the inventory call
+    A container for the inventory call
     This may be extended in the future, depending on our needs.
     """
 
-    def __init__(self, target):
+    def __init__(self, target=None):
         Base.__init__(self)
-        self.target = target if target is not None else self.base_target
+        self.target = target if target is not None else self.compound_target
         log.debug("Retrieving Inventory for target {}".format(self.target))
-        self.raw = self.local_client.cmd(
-            self.target, "cmd.run", ["ceph-volume inventory --format json"]
-        )
+
+    @property
+    def raw(self) -> dict:
+        """ Raw data from a ceph-volume inventory call via salt
+        """
+        return self.local_client.cmd(self.target, "cmd.run",
+                                     ["ceph-volume inventory --format json"])
+
+    @property
+    def disks(self) -> list:
+        """ All disks found on the 'target'
+
+        Loads the json data from ceph-volume inventory
+        """
+        return json.loads((list(self.raw.values()))[0])
 
 
 class Matcher(Base):
     """ The base class to all Matchers
 
     It holds utility methods such as _virtual, _get_disk_key
-    and hanles the initialization.
+    and handles the initialization.
 
     Inherits from Base
     """
 
-    def __init__(self, attr: str, key: str):
+    def __init__(self, key: str, value: str) -> None:
+        """ Initialization of Base class
+
+        :param str key: Attribute like 'model, size or vendor'
+        :param str value: Value of attribute like 'X123, 5G or samsung'
+        """
         Base.__init__(self)
-        self.attr: str = attr
         self.key: str = key
-        self.fallback_key: str = None
+        self.value: str = value
+        self.fallback_key: str = ''
         self.virtual: bool = self._virtual()
 
     def _virtual(self):
@@ -84,9 +161,8 @@ class Matcher(Base):
         runs on virtual environments. This is subject to be
         moved/changed/removed
         """
-        virtual: dict = self.local_client.cmd(
-            self.base_target, "grains.get", ["virtual"]
-        )
+        virtual: dict = self.local_client.cmd(self.compound_target,
+                                              "grains.get", ["virtual"])
         flag: bool = False
         for host, val in virtual.items():
             if val != "physical":
@@ -96,12 +172,12 @@ class Matcher(Base):
 
     # pylint: disable=inconsistent-return-statements
     def _get_disk_key(self, disk: dict) -> str:
-        """ Helper method to safely extract values form the disk dicto
+        """ Helper method to safely extract values form the disk dict
 
         There is a 'key' and a _optional_ 'fallback' key that can be used.
         The reason for this is that the output of ceph-volume is not always
         consistent (due to a bug currently, but you never know).
-        There is also a safety meassure for a disk_key not existing on
+        There is also a safety measure for a disk_key not existing on
         virtual environments. ceph-volume apparently sources its information
         from udev which seems to not populate certain fields on VMs.
 
@@ -110,52 +186,81 @@ class Matcher(Base):
         :return: A disk value
         :rtype: str
         """
-        disk_key: str = disk.get(self.key)
-        if not disk_key and self.fallback_key:
-            disk_key: str = disk.get(self.fallback_key)
-        if disk_key:
-            return disk_key
+        disk_value: str = disk.get(self.key, None)
+        if not disk_value and self.fallback_key:
+            disk_value = disk.get(self.fallback_key, None)
+        if disk_value:
+            return disk_value
         if self.virtual:
             log.info(
                 "Virtual-env detected. Not raising Exception on missing keys."
                 " {} and {} appear not to be present".format(
-                    self.key, self.fallback_key
-                )
-            )
+                    self.key, self.fallback_key))
+            return ''
         else:
-            raise Exception(
-                "No disk_key found for {} or {}".format(self.key, self.fallback_key)
-            )
+            raise Exception("No value found for {} or {}".format(
+                self.key, self.fallback_key))
+
+    def compare(self, disk: dict):
+        """ Implements a valid comparison method for a SubMatcher
+        This will get overwritten by the individual classes
+
+        :param dict disk: A disk representation
+        """
+        pass
 
 
 class SubstringMatcher(Matcher):
     """ Substring matcher subclass
     """
 
-    def __init__(self, attr: str, key: str, fallback_key=None):
-        Matcher.__init__(self, attr, key)
+    def __init__(self, key: str, value: str, fallback_key=None) -> None:
+        Matcher.__init__(self, key, value)
         self.fallback_key = fallback_key
 
-    def compare(self, disk: dict):
+    def compare(self, disk: dict) -> bool:
         """ Overwritten method to match substrings
 
         This matcher does substring matching
-        :param dict disk: A disk representation
+        :param dict disk: A disk representation (see base for examples)
         :return: True/False if the match succeeded
         :rtype: bool
         """
-        disk_key: str = self._get_disk_key(disk)
-        if str(self.attr) in str(disk_key):
+        disk_value: str = self._get_disk_key(disk)
+        if str(self.value) in str(disk_value):
             return True
         return False
+
+
+class AllMatcher(Matcher):
+    """ All matcher subclass
+    """
+
+    def __init__(self, key: str, value: str, fallback_key=None) -> None:
+        Matcher.__init__(self, key, value)
+        self.fallback_key = fallback_key
+
+    def compare(self, disk: dict) -> bool:
+        """ Overwritten method to match all
+
+        A rather dump matcher that just accepts all disks
+        (regardless of the value)
+        # note:
+            Should it be possible to set all: False ?
+            I don't think so.. We have limit for that
+        :param dict disk: A disk representation (see base for examples)
+        :return: always True
+        :rtype: bool
+        """
+        return True
 
 
 class EqualityMatcher(Matcher):
     """ Equality matcher subclass
     """
 
-    def __init__(self, attr: str, key: str):
-        Matcher.__init__(self, attr, key)
+    def __init__(self, key: str, value: str) -> None:
+        Matcher.__init__(self, key, value)
 
     def compare(self, disk: dict) -> bool:
         """ Overwritten method to match equality
@@ -165,19 +270,23 @@ class EqualityMatcher(Matcher):
         :return: True/False if the match succeeded
         :rtype: bool
         """
-        disk_key: str = self._get_disk_key(disk)
-        if int(disk_key) == int(self.attr):
+        disk_value: str = self._get_disk_key(disk)
+        if int(disk_value) == int(self.value):
             return True
         return False
 
 
 class SizeMatcher(Matcher):
-    """ Equality matcher subclass
+    """ Size matcher subclass
     """
 
     # pylint: disable=too-many-instance-attributes
-    def __init__(self, attr: str, key: str):
-        Matcher.__init__(self, attr, key)
+    def __init__(self, key: str, value: str) -> None:
+        # The 'key' value is overwritten here because
+        # the user_defined attribute does not neccessarily
+        # correspond to the desired attribute
+        # requested from the inventory output
+        Matcher.__init__(self, key, value)
         self.key: str = "human_readable_size"
         self.fallback_key: str = "size"
         self._high = None
@@ -195,7 +304,7 @@ class SizeMatcher(Matcher):
         return self._low, self._low_suffix
 
     @low.setter
-    def low(self, low: Tuple):
+    def low(self, low: Tuple) -> None:
         """ Setter for 'low' matchers
         """
         self._low, self._low_suffix = low
@@ -207,7 +316,7 @@ class SizeMatcher(Matcher):
         return self._high, self._high_suffix
 
     @high.setter
-    def high(self, high: Tuple):
+    def high(self, high: Tuple) -> None:
         """ Setter for 'high' matchers
         """
         self._high, self._high_suffix = high
@@ -219,13 +328,13 @@ class SizeMatcher(Matcher):
         return self._exact, self._exact_suffix
 
     @exact.setter
-    def exact(self, exact: Tuple):
+    def exact(self, exact: Tuple) -> None:
         """ Setter for 'exact' matchers
         """
         self._exact, self._exact_suffix = exact
 
     @property
-    def supported_suffixes(self):
+    def supported_suffixes(self) -> list:
         """ Only power of 10 notation is supported
         """
         return ["MB", "GB", "TB", "M", "G", "T"]
@@ -244,7 +353,7 @@ class SizeMatcher(Matcher):
         :rtype: str
         """
         if suffix not in self.supported_suffixes:
-            raise Exception("Unit {} not supported".format(suffix))
+            raise UnitNotSupported("Unit '{}' not supported".format(suffix))
         if suffix == "G":
             return "GB"
         if suffix == "T":
@@ -295,26 +404,26 @@ class SizeMatcher(Matcher):
         This method uses regex to identify and extract this information
         and raises if none could be found.
         """
-        low_high = re.match(r"\d+[A-Z]:\d+[A-Z]", self.attr)
+        low_high = re.match(r"\d+[A-Z]{1,2}:\d+[A-Z]{1,2}", self.value)
         if low_high:
             low, high = low_high.group().split(":")
             self.low = self._get_k_v(low)
             self.high = self._get_k_v(high)
 
-        low = re.match(r"\d+[A-Z]:$", self.attr)
+        low = re.match(r"\d+[A-Z]{1,2}:$", self.value)
         if low:
             self.low = self._get_k_v(low.group())
 
-        high = re.match(r"^:\d+[A-Z]", self.attr)
+        high = re.match(r"^:\d+[A-Z]{1,2}", self.value)
         if high:
             self.high = self._get_k_v(high.group())
 
-        exact = re.match(r"^\d+[A-Z]$", self.attr)
+        exact = re.match(r"^\d+[A-Z]{1,2}$", self.value)
         if exact:
             self.exact = self._get_k_v(exact.group())
 
         if not self.low and not self.high and not self.exact:
-            raise Exception("Couldn't parse {}".format(self.attr))
+            raise Exception("Couldn't parse {}".format(self.value))
 
     @staticmethod
     # pylint: disable=inconsistent-return-statements
@@ -329,10 +438,13 @@ class SizeMatcher(Matcher):
         suffix = tpl[1]
         if suffix == "MB":
             return value * 1e+6
-        if suffix == "GB":
+        elif suffix == "GB":
             return value * 1e+9
-        if suffix == "TB":
+        elif suffix == "TB":
             return value * 1e+12
+        # TODO: checkers force me to return something, although
+        # it's not quite good to return something here.. ignore?
+        return 0.00
 
     # pylint: disable=inconsistent-return-statements
     def compare(self, disk: dict) -> bool:
@@ -341,21 +453,26 @@ class SizeMatcher(Matcher):
         1) Extracts information from the to-be-inspected disk.
         2) Depending on the mode, apply checks and return
 
-        #todo This doesn't seem very solid and _may_
-        be refactored
+        # TODO This doesn't seem very solid and _may_
+        be re-factored
 
 
         """
-        disk_key = self._get_disk_key(disk)
-        disk_size = float(re.findall(r"\d+\.\d+", disk_key)[0])
-        disk_suffix = self._parse_suffix(disk_key)
+        disk_value = self._get_disk_key(disk)
+        # This doesn't neccessarily have to be a float.
+        # The current output from ceph-volume gives a float..
+        # This may change in the future..
+        # TODO: harden this paragraph
+        disk_size = float(re.findall(r"\d+\.\d+", disk_value)[0])
+        disk_suffix = self._parse_suffix(disk_value)
         disk_size_in_byte = self.to_byte((disk_size, disk_suffix))
 
         if all(self.high) and all(self.low):
             if disk_size_in_byte <= self.to_byte(
-                self.high
-            ) and disk_size_in_byte >= self.to_byte(self.low):
+                    self.high) and disk_size_in_byte >= self.to_byte(self.low):
                 return True
+            # is a else: return False neccessary here?
+            # (and in all other branches)
             log.debug("Disk didn't match for 'high/low' filter")
 
         elif all(self.low) and not all(self.high):
@@ -377,7 +494,7 @@ class SizeMatcher(Matcher):
             raise Exception("No filters applied")
 
 
-class DriveGroup(Base):
+class DriveGroup(Base, Thread):
     """ The Drive-Group class
 
     Targets on node and applies filters on the node's inventory
@@ -390,43 +507,125 @@ class DriveGroup(Base):
 
     # pylint: disable=too-many-instance-attributes
     def __init__(self, target) -> None:
+        Thread.__init__(self)
         Base.__init__(self)
         self.target: str = target
-        self.raw: list = list(
-            self.local_client.cmd(target, "pillar.get", ["drive_group"]).values()
-        )[0]
-        self.data_device_attrs: dict = self.raw.get("data_devices", dict())
-        self.wal_devices_attrs: dict = self.raw.get("wal_devices", dict())
-        self.db_devices_attrs: dict = self.raw.get("db_devices", dict())
-        self.encryption: bool = self.raw.get("encryption", False)
-        self.wal_slots: int = self.raw.get("wal_slots", None)
-        self.db_slots: int = self.raw.get("db_slots", None)
-        # harder this
-        self.inventory: dict = json.loads((list(Inventory(target).raw.values()))[0])
         self._check_filter_support()
+        self._data_devices = None
+        self._wal_devices = None
+        self._db_devices = None
 
     @property
-    def data_devices(self) -> set:
+    def raw(self) -> dict:
+        """ Raw data from a pillar.get -> drive_group call
+        """
+        return list(
+            self.local_client.cmd(self.target, "pillar.get",
+                                  ["drive_group"]).values())[0]
+
+    @property
+    def db_slots(self) -> dict:
+        """ Property of db_slots
+
+        db_slots are essentially ratio indicators
+        :return: The value of db_slots
+        :rtype: dict
+        """
+        return self.raw.get("db_slots", False)
+
+    @property
+    def wal_slots(self) -> dict:
+        """ Property of wal_slots
+
+        wal_slots are essentially ratio indicators
+        """
+        return self.raw.get("wal_slots", False)
+
+    @property
+    def encryption(self) -> dict:
+        """ Property of encryption
+
+        True/Flase if encryption is enabled
+        """
+        return self.raw.get("encryption", False)
+
+    @property
+    def data_device_attrs(self) -> dict:
+        """
+        TODO docstring
+        """
+        return self.raw.get("data_devices", dict())
+
+    @property
+    def db_device_attrs(self) -> dict:
+        """
+        TODO docstring
+        """
+        return self.raw.get("db_devices", dict())
+
+    @property
+    def wal_device_attrs(self) -> dict:
+        """
+        TODO docstring
+        """
+        return self.raw.get("wal_devices", dict())
+
+    @property
+    def limit(self) -> int:
+        """ Limits the amount of devices assigned
+
+        Limit 0 -> unlimited
+        """
+        return self.data_device_attrs.get("limit", 0)
+
+    @property
+    def inventory(self) -> dict:
+        """
+        TODO
+        """
+        return Inventory(self.target).disks
+
+    @property
+    def data_devices(self) -> list:
         """ Filter for (bluestore) DATA devices
         """
-        log.warning("Scanning for data devices on host {}".format(self.target))
+        log.debug("Scanning for data devices on host {}".format(self.target))
         return self._filter_devices(self.data_device_attrs)
 
     @property
-    def wal_devices(self) -> set:
+    def wal_devices(self) -> list:
         """ Filter for bluestore WAL devices
         """
-        log.warning("Scanning for wal devices on host {}".format(self.target))
-        return self._filter_devices(self.wal_devices_attrs)
+        log.debug("Scanning for WAL devices on host {}".format(self.target))
+        return self._filter_devices(self.wal_device_attrs)
 
     @property
-    def db_devices(self) -> set:
+    def db_devices(self) -> list:
         """ Filter for bluestore DB devices
         """
-        log.warning("Scanning for db devices on host {}".format(self.target))
-        return self._filter_devices(self.db_devices_attrs)
+        log.debug("Scanning for db devices on host {}".format(self.target))
+        return self._filter_devices(self.db_device_attrs)
 
-    def _filter_devices(self, device_filter: dict) -> Set:
+    def _limit_reached(self, len_devices: int, disk_path: str) -> bool:
+        """ Check for the <limit> property and apply logic
+
+        If a limit is set in 'device_attrs' we have to stop adding
+        disks at some point.
+
+        If limit is set (>0) and len(devices) >= limit
+
+        :param int len_devices: Length of the already populated device set/list
+        :param str disk_path: The disk identifier (for logging purposes)
+        :return: True/False if the device should be added to the list of devices
+        :rtype: bool
+        """
+        if self.limit > 0 and len_devices >= self.limit:
+            log.info("Refuse to add {} due to limit policy of {}>".format(
+                disk_path, self.limit))
+            return True
+        return False
+
+    def _filter_devices(self, device_filter: dict) -> list:
         """ Filters devices with applied filters
 
         Iterates over all applied filter (there can be multiple):
@@ -434,6 +633,10 @@ class DriveGroup(Base):
         size: 10G:50G
         model: Fujitsu
         rotational: 1
+
+        TODO:
+        This currently acts as a OR gate. Should this be a AND gate?
+        TODO:
 
         Iterates over all known disk (on one host(self.target)) and checks
         for matches by using the matcher subclasses.
@@ -444,34 +647,49 @@ class DriveGroup(Base):
         """
         devices: Set = set()
         for name, val in device_filter.items():
-            matcher = self._assign_matchers(name, val)
-            log.debug("Scanning with filter {}:{}".format(name, val))
+            filter = Filter(name=name, value=val)
             for disk in self.inventory:
-                if not self.__match(self._reduce_inventory(disk), matcher):
+                # continue criterias
+                if not filter.is_matchable:
                     continue
-                if disk.get("path", None):
-                    log.debug("Found matching disk: {}".format(disk.get("path")))
-                    devices.add(disk.get("path"))
-                else:
-                    raise Exception(
-                        "Disk {} doesn't have a 'path' identifier".format(disk)
-                    )
 
-        return devices
+                if not filter.matcher.compare(self._reduce_inventory(disk)):
+                    continue
+
+                if not self._has_mandatory_idents(disk):
+                    continue
+
+                if self._limit_reached(len(devices), disk.get('path')):
+                    continue
+
+                devices.add(disk.get("path"))
+
+        # sorted() returns a sorted list by the cost of losing the <set>
+        return sorted(devices)
+
+    def _has_mandatory_idents(self, disk: dict) -> bool:
+        if disk.get("path", None):
+            log.debug("Found matching disk: {}".format(disk.get("path")))
+            return True
+        else:
+            raise Exception(
+                "Disk {} doesn't have a 'path' identifier".format(disk))
 
     @property
     def _supported_filters(self) -> list:
         """ List of supported filters
         """
-        return ["size", "vendor", "model", "rotates"]
+        return [
+            "size", "vendor", "model", "rotational", "limit", "osds_per_device"
+        ]
 
     def _check_filter_support(self) -> None:
         """ Iterates over attrs to check support
         """
         for attr in [
-            self.data_device_attrs,
-            self.wal_devices_attrs,
-            self.db_devices_attrs,
+                self.data_device_attrs,
+                self.wal_device_attrs,
+                self.db_device_attrs,
         ]:
             self._check_filter(attr)
 
@@ -485,55 +703,14 @@ class DriveGroup(Base):
         for applied_filter in list(attr.keys()):
             if applied_filter not in self._supported_filters:
                 raise FilterNotSupported(
-                    "Filter {} is not supported".format(applied_filter)
-                )
-
-    @staticmethod
-    def _assign_matchers(filter_name: str, filter_value: str):
-        """ Assign a matcher based on filter_name
-
-        This method assigns an individual Matcher based
-        on `filter_name` and returns it.
-
-        :param str filter_name: The filter (size, model, vendor..)
-        :param str filter_value: The filter_value (0,1, 'Samsung', '10G')
-        :return: Any of the assigned matcher
-        :rtype: *Matcher
-        """
-        if filter_name == "size":
-            return SizeMatcher(filter_value, filter_name)
-        elif filter_name == "model":
-            return SubstringMatcher(filter_value, filter_name)
-        elif filter_name == "vendor":
-            return SubstringMatcher(filter_value, filter_name)
-        elif filter_name == "rotates":
-            return EqualityMatcher(filter_value, filter_name)
-        else:
-            raise NoMatcherFound(
-                "No Matcher found for {}:{}".format(filter_name, filter_value)
-            )
-
-    @staticmethod
-    def __match(disk: dict, matcher) -> bool:
-        """ Compares disk properties
-
-        Calls the compare method of the passed `matcher`
-        with the passed `disk`.
-
-        :param dict disk: A description of a disk
-        :param Matcher matcher: The matcher subclass
-        :return: True of False
-        :rtype: bool
-
-        """
-        return matcher.compare(disk)
+                    "Filtering for {} is not supported".format(applied_filter))
 
     @staticmethod
     # pylint: disable=inconsistent-return-statements
     def _reduce_inventory(disk: dict) -> dict:
         """ Wrapper to validate 'ceph-volume inventory' output
         """
-        #FIXME: Temp disable this check, only for testing purposes
+        # FIXME: Temp disable this check, only for testing purposes
         # maybe this check doesn't need to be here as ceph-volume
         # does this check aswell..
         # This also mostly exists due to:
@@ -544,42 +721,74 @@ class DriveGroup(Base):
                 reduced_disk = {"path": disk.get("path")}
 
                 reduced_disk["size"] = disk.get("sys_api", {}).get(
-                    "human_readable_size", ""
-                )
-                reduced_disk["vendor"] = disk.get("sys_api", {}).get("vendor", "")
-                reduced_disk["bare_size"] = disk.get("sys_api", {}).get("size", "")
-                reduced_disk["model"] = disk.get("sys_api", {}).get("model", "")
+                    "human_readable_size", "")
+                reduced_disk["vendor"] = disk.get("sys_api", {}).get(
+                    "vendor", "")
+                reduced_disk["bare_size"] = disk.get("sys_api", {}).get(
+                    "size", "")
+                reduced_disk["model"] = disk.get("sys_api", {}).get(
+                    "model", "")
+                reduced_disk["rotational"] = disk.get("sys_api", {}).get(
+                    "rotational", "")
+
                 return reduced_disk
             except KeyError("Could not retrieve mandatory key from disk spec"):
                 raise
+
+    def run(self):
+        self._data_devices = self.data_devices
+        self._db_devices = self.db_devices
+        self._wal_devices = self.wal_devices
 
 
 class DriveGroups(Base):
     """ A DriveGroup container class
 
-    It resolves the 'host_target' from the drive_group spec and
-    feeds the 'target' on by one to the DriveGroup class
+    self._data_devices = None
+    It resolves the 'target' from the drive_group spec and
+    feeds the 'target' one by one to the DriveGroup class.
     This in turn filters all matching devices and returns
+    self._data_devices = None
+    matching disks based on the specified filters.
     """
 
     def __init__(self):
         Base.__init__(self)
-        self.targets: list = list(
-            self.local_client.cmd(self.base_target, "cmd.run", ["test.ping"]).keys()
-        )
 
     def generate(self):
-        """ Generate DriveGroups for all targets
+        self._data_devices = None
+        """ Generate/show matching disks
+
+        self._data_devices = None
+        Iterate over the resolved_targets (actual names that
+        self._data_devices = None
+        are resolved from the compound target provided via the
+        drivegroup definition) and generates the DriveGroups.
+
+        Use threading to save time.
         """
-        for target in self.targets:
-            drive_group = DriveGroup(target)
-            print(drive_group.data_devices)
-            print(drive_group.wal_devices)
-            print(drive_group.db_devices)
-            print("\n")
+        threads = []
+        for target in self.resolved_targets:
+            dg = DriveGroup(target)
+            threads.append(dg)
+            dg.start()
+        return threads
 
 
 def test():
     """ Generate DriveGroups for specification.
     """
-    DriveGroups().generate()
+    threads = DriveGroups().generate()
+    for ret in threads:
+        print('Evaluating threads')
+        ret.join()
+        print('Printing devices for {}'.format(ret.target))
+        print(ret._data_devices)
+        print(ret._db_devices)
+        print(ret._wal_devices)
+
+
+def help():
+    """ Help/Usage class
+    """
+    print("Dummy helper function")
