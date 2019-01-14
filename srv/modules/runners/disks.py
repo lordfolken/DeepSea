@@ -34,18 +34,19 @@ class Base(object):
     """ The base class container for local_client and compound_target assignment
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self):
         self.local_client = salt.client.LocalClient()
 
-        # harden this - validate?
-        self.compound_target: str = list(
+    def compound_target(self) -> list:
+        return list(
             self.local_client.cmd(
                 'G@deepsea:*',
                 'pillar.get', ['drive_group'],
                 expr_form='compound').values())[0]['target']
 
-        self.resolved_targets: list = list(
-            self.local_client.cmd(self.compound_target, "cmd.run",
+    def resolved_targets(self) -> list:
+        return list(
+            self.local_client.cmd(self.compound_target(), "cmd.run",
                                   ["test.ping"]).keys())
 
 
@@ -111,7 +112,7 @@ class Inventory(Base):
 
     def __init__(self, target=None):
         Base.__init__(self)
-        self.target = target if target is not None else self.compound_target
+        self.target = target
         log.debug("Retrieving Inventory for target {}".format(self.target))
 
     @property
@@ -736,6 +737,11 @@ class DriveGroup(Base, Thread):
                 raise
 
     def run(self):
+        """ Necessary method for Thread to initialize
+
+        Binding the important data to attributes rather than
+        properties.
+        """
         self._data_devices = self.data_devices
         self._db_devices = self.db_devices
         self._wal_devices = self.wal_devices
@@ -768,9 +774,10 @@ class DriveGroups(Base):
         Use threading to save time.
         """
         threads = []
-        for target in self.resolved_targets:
+        for target in self.resolved_targets():
             dg = DriveGroup(target)
             threads.append(dg)
+            log.debug("Starting Thread for target {}".format(target))
             dg.start()
         return threads
 
@@ -780,9 +787,8 @@ def test():
     """
     threads = DriveGroups().generate()
     for ret in threads:
-        print('Evaluating threads')
+        print('Waiting for threads to finish')
         ret.join()
-        print('Printing devices for {}'.format(ret.target))
         print(ret._data_devices)
         print(ret._db_devices)
         print(ret._wal_devices)

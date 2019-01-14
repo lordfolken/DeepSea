@@ -9,26 +9,24 @@ class TestBase(object):
 
     @patch("salt.client.LocalClient", autospec=True)
     def test_base_init(self, mock_client):
-        kwargs = {'target': 'a_valid_target'}
-        base = disks.Base(**kwargs)
-        assert base.base_target == 'a_valid_target'
+        local = mock_client.return_value
+        local.cmd.return_value = {'admin.ceph': {'target': 'data*'}}
+        base = disks.Base().compound_target()
+        assert base == 'data*'
 
     @patch("salt.client.LocalClient", autospec=True)
     def test_base_init_default(self, mock_client):
+        local = mock_client.return_value
+        local.cmd.side_effect = [{'admin.ceph': {'target': 'data*'}},
+                                  {'node1': {'results': 'True'},
+                                  'node2': {'results': 'True'}}]
         base = disks.Base()
-        assert base.base_target == '*'
+        assert base.resolved_targets() == ['node1', 'node2']
 
 
 class TestInventory(object):
     """ Test Inventory container class
     """
-
-    @patch("salt.client.LocalClient", autospec=True)
-    def test_inventory_init(self, mock_client):
-        """ inv.base_target defaults to '*'
-        """
-        inv = disks.Inventory()
-        assert inv.target == '*'
 
     @patch("salt.client.LocalClient", autospec=True)
     def test_inventory_init_target_overwrite(self, mock_client):
@@ -42,8 +40,8 @@ class TestInventory(object):
         """ Overwrite the target
         """
         local_client = mock_client.return_value
-        disks.Inventory().raw()
-        call1 = call('*', "cmd.run", ["ceph-volume inventory --format json"])
+        disks.Inventory('node1').raw()
+        call1 = call('node1', "cmd.run", ["ceph-volume inventory --format json"])
         assert call1 in local_client.cmd.mock_calls
 
 
@@ -834,13 +832,12 @@ class TestDriveGroup(object):
 
 
 class TestDriveGroups(object):
-    @patch("salt.client.LocalClient", autospec=True)
     @patch('srv.modules.runners.disks.DriveGroup')
-    def test_generate(self, drive_group_mock, mock_client):
-        local = mock_client.return_value
-        local.cmd.return_value = {'foo': {'internals'}, 'bar': {'internals'}}
+    @patch('srv.modules.runners.disks.Base.resolved_targets')
+    def test_generate(self, resolved_targets_mock, drive_group_mock):
+        resolved_targets_mock.return_value = ['node1']
         disks.DriveGroups().generate()
-        drive_group_mock.assert_called_with('bar')
+        drive_group_mock.assert_called_with('node1')
 
 
 class TestFilter(object):
