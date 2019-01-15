@@ -29,6 +29,18 @@ class UnitNotSupported(Exception):
     pass
 
 
+class NoMinionsFound(Exception):
+    """ A critical error when no minions are returned from deepsea_minions.show()
+    """
+    pass
+
+
+class NoTargetFound(Exception):
+    """ A critical error when no target is found for DriveGroup targeting
+    """
+    pass
+
+
 # pylint: disable=too-few-public-methods
 class Base(object):
     """ The base class container for local_client and compound_target assignment
@@ -36,18 +48,85 @@ class Base(object):
 
     def __init__(self):
         self.local_client = salt.client.LocalClient()
+        self.deepsea_minions = __utils__['deepsea_minions.show']()
+        self._validate()
 
-    def compound_target(self) -> list:
-        return list(
-            self.local_client.cmd(
-                'G@deepsea:*',
-                'pillar.get', ['drive_group'],
-                expr_form='compound').values())[0]['target']
+    def _validate(self):
+        if not self.deepsea_minions:
+            raise NoMinionsFound("No minions found")
+
+    def compound_target(self) -> str:
+        """ The 'target' key which the user identfies the OSD nodes
+
+        This will source the 'drive_group' pillar entry
+        and extract the 'target'
+
+        Salt tends to return all sorts of bulls^&%, hence the extensive
+        validation
+
+        :return: The target indentifying the osd nodes
+        :rtype: str
+        """
+        ret = self.local_client.cmd(
+            self.deepsea_minions,
+            'pillar.get', ['drive_group'],
+            expr_form='compound')
+        if not ret:
+            raise RuntimeError(
+                "Could not get a return of 'salt '*' pillar.get drive_group")
+
+        if not isinstance(ret, dict):
+            raise RuntimeError(
+                "salt '*' pillar.get drive_group did not return a dictionary")
+
+        pillar_of_hosts = list(ret.values())
+        if not isinstance(pillar_of_hosts, list) and not len(ret) < 1:
+            raise RuntimeError("Expected a list - Got a {}".format(
+                type(pillar_of_hosts)))
+
+        pillar_first_host = pillar_of_hosts[0]
+        if not isinstance(pillar_first_host, dict):
+            raise RuntimeError("Expected a dict - Got a {}".format(
+                type(pillar_first_host)))
+
+        target = pillar_first_host.get('target', '')
+        if target and isinstance(target, str):
+            return target
+        else:
+            raise NoTargetFound(
+                "Could not find a 'target' in the drive_group definition. "
+                "Please refer to the documentation")
 
     def resolved_targets(self) -> list:
-        return list(
-            self.local_client.cmd(self.compound_target(), "cmd.run",
-                                  ["test.ping"]).keys())
+        """ Resolved targets (actual hostnames/saltnames)
+
+        test.pings the generated compound_target to extract the
+        actual hostnames/saltnames
+
+        Salt tends to return all sorts of bulls^&%, hence the extensive
+        validation
+
+        :return: resolved targets
+        :rtype: list
+        """
+        ret = self.local_client.cmd(self.compound_target(), "cmd.shell",
+                                    ["test.ping"])
+        if not ret:
+            raise RuntimeError(
+                "Could not get a return of 'salt '{}' cmd.shell test.ping".
+                format(self.compound_target()))
+        if not isinstance(ret, dict):
+            raise RuntimeError(
+                "salt '{}' cmd.shell did not return a dictionary".format(
+                    self.deepsea_minions))
+
+        host_names = list(ret.keys())
+        if host_names:
+            return host_names
+        else:
+            raise NoMinionsFound(
+                "Could not determine hosts from identifier {}".format(
+                    self.compound_target()))
 
 
 class Filter(object):
